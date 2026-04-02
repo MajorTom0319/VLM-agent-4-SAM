@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 用法：
-#   bash run_folder_pipeline.sh /path/to/images /path/to/output_root
-# 也可通过环境变量覆盖：SAM_CKPT, SAM_ARCH, DEVICE, MAX_OBJECTS, POINTS_PER_TYPE, BOX_PAD, MIN_AREA, NMS_IOU
+# how to use：
+#   bash run.sh /path/to/images 
 
-IMAGE_DIR="${1:-/home/majortom/majortom/datasets/desktopobjects_360/desk1_4_VLM/images_4}"
+
+IMAGE_DIR="${1:-/home/majortom/majortom/datasets/nerf_llff_data/trex/images_4}"
 OUTPUT_ROOT="${2:-$(dirname "$IMAGE_DIR")}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

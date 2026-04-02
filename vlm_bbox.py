@@ -4,12 +4,12 @@ import os
 from openai import OpenAI
 from PIL import Image
 
-MODEL = os.environ.get("VLM_MODEL", "gemini-3-pro-preview")
+MODEL = os.environ.get("VLM_MODEL", "gemini-3.1-pro-preview")
 BASE_URL = os.environ.get("VLM_BASE_URL", "https://api.vectorengine.ai/v1")
 
 client = OpenAI(
     base_url=BASE_URL,
-    api_key=os.environ.get("VLM_API_KEY", ""),
+    api_key=os.environ.get("VLM_API_KEY", "sk-7k47Hby1ncfVkDKrOyEzhAofEVwCuSw2LxPLT2Rtgv6Ff1x2"),
 )
 
 def _image_to_data_url(image_path: str) -> str:
@@ -97,7 +97,7 @@ def _parse_points(points, w, h):
             y_pix = y_norm * h / 1000.0
             x_pix = x_norm * w / 1000.0
 
-            if 0 <= y_pix <= h or 0 <= x_pix <= w:
+            if 0 <= y_pix <= h and 0 <= x_pix <= w:
                 out.append([float(y_norm), float(x_norm)])
     return out
 
@@ -111,7 +111,7 @@ def _norm1000_xy_to_px(pt, width: int, height: int):
 
 def vlm_get_all_bboxes(
     image_path: str,
-    max_objects: int = 15,
+    max_objects: int = 10,
     # max_background: int = 3,
     pad_ratio: float = 0.05,
     points_per_type: int = 8,
@@ -137,122 +137,168 @@ def vlm_get_all_bboxes(
     print(f"Image size: width={w}, height={h}")
 
     system = (
-        "You are a precise visual grounding assistant specialized for segmentation prompting."
+        "ROLE:\n"
+        "You are a precise visual grounding assistant specialized in INSTANCE-LEVEL object detection for segmentation.\n\n"
 
-        "Goal:"
-        "Given ONE image, detect distinct FOREGROUND object instances and output a JSON list. Each instance must include:"
-        "- a tight 2D bounding box around the VISIBLE pixels of that single object instance"
-        "- positive points on the object (to help SAM fill holes and cover reflective/textureless areas)"
-        "- negative points on non-object regions near boundaries/adjacent objects (to prevent leakage/merging)"
+        "PRIMARY OBJECTIVE:\n"
+        "Return prompts (box_2d + pos_points + neg_points) for all salient, standalone, instance-level objects in the image.\n"
+        "Focus on WHOLE objects only, not object parts, attributes, textures, or background regions.\n\n"
 
-        " IMPORTANT OUTPUT RULES:"
-        "- Output MUST be strict JSON only (no markdown, no explanation)."
-        "- Use normalized coordinates in [0,1000]."
-        "- Box format: box_2d = [ymin, xmin, ymax, xmax]."
-        "- Point format: [y, x]."
-        "- Integers preferred; floats allowed but must still be within [0,1000]."
+        "WHAT COUNTS AS ONE OBJECT INSTANCE:\n"
+        "- One physical object = one entry.\n"
+        "- The object must be recognized as a complete instance at its natural semantic level.\n"
+        "- Examples:\n"
+        "  * one whole dinosaur skeleton = one object\n"
+        "  * one whole flower = one object\n"
+        "  * one whole tree = one object\n"
+        "  * one whole car = one object\n"
+        "  * one whole chair = one object\n\n"
 
-        "OBJECT INSTANCE DEFINITION:"
-        "- Each entry represents ONE single physical object instance."
-        "- Do NOT merge multiple objects into one box, even if they touch or are similar."
-        "- Exclude pure background regions (tabletop/wall/floor) unless they are a physical object (e.g., a box, a book, a device)."
+        "INSTANCE CONSISTENCY (CRITICAL):\n"
+        "- ONE ENTRY = ONE WHOLE OBJECT INSTANCE.\n"
+        "- Do NOT split a single object into parts.\n"
+        "- Do NOT label object parts as separate instances.\n"
+        "- Do NOT output separate entries for head, body, tail, branch, leaf cluster, flower petal, wheel, window, handle, or other sub-parts if they belong to the same object.\n"
+        "- If a single object contains many visible components but forms one semantic whole, output exactly ONE entry.\n"
+        "- Do NOT duplicate the same object with different labels.\n"
+        "- Do NOT create multiple overlapping boxes for the same physical object.\n\n"
 
-        "BOX QUALITY REQUIREMENTS (TIGHT-VISIBLE):"
-        "- The box must tightly enclose the object's visible silhouette:"
-        "- close to the outer boundary on all 4 sides"
-        "- include all visible parts of the object (do NOT cut off)"
-        "- do NOT include large background margins"
-        "- If the object is partially occluded, box only the visible part of the object (not the occluder)."
-        "- For thin parts (handles, cables, legs): ensure they are included if visible."
-        "- If uncertain between too tight vs slightly larger: prefer SLIGHTLY larger, but still tight."
+        "WHOLE-OBJECT PRIORITY:\n"
+        "- Prefer the complete semantic object over local visible parts.\n"
+        "- For articulated, thin, or complex structures, still treat them as one instance if they belong to one object.\n"
+        "- For example:\n"
+        "  * a mounted T-rex skeleton is one object, not skull/ribs/legs/tail\n"
+        "  * a flowering plant is one object if shown as a single plant instance\n"
+        "  * a tree is one object, not trunk/branches/leaves separately\n\n"
 
-        "POINT REQUIREMENTS:"
-        "Positive points (pos_points):"
-        "- Place ON the target object, spread across different parts."
-        "- Must include at least:"
-        "- 1 point near the center mass of the object"
-        "- multiple points on challenging regions: reflective, shadowed, low-texture, transparent, or dark areas (to avoid holes)"
-        "- All pos_points MUST lie inside box_2d."
+        "OCCLUSION AND TRUNCATION:\n"
+        "- If an object is partially occluded or truncated by the image boundary, still output it as one instance if it is clearly a single object.\n"
+        "- The box should cover all visible parts of that object.\n"
+        "- Do NOT hallucinate invisible parts outside the image.\n\n"
 
-        "Negative points (neg_points):"
-        "- Place on NON-target pixels."
-        "- Focus on separation:"
-        "- on adjacent/touching objects near the contact boundary"
-        "- on occluders covering the target"
-        "- on background close to edges of the target to stop mask leakage"
-        "- Avoid placing neg_points far away; keep them near the object boundary."
-        "- neg_points should preferably be outside box_2d; if not possible, they still must be outside the object region."
+        "WHAT TO IGNORE:\n"
+        "- Ignore background/stuff regions such as wall, floor, sky, grass, road, table surface, and other scene regions unless they are clearly standalone physical objects.\n"
+        "- Ignore tiny clutter or ambiguous fragments that are not meaningful standalone instances.\n"
+        "- Ignore patterns, shadows, reflections, and textures.\n\n"
 
-        "HARD CASE GUIDELINES:"
-        "- Many small objects: output the most salient up to Max objects; avoid random tiny clutter unless clearly a distinct object."
-        "- Similar repeated objects: output separate instances if spatially separated."
-        "- Transparent/reflective objects: use more pos_points on highlights and dark regions; use neg_points on background behind/around."
-        "- Text on surfaces is not a separate object unless it is a physical item (e.g., a sticker/label as a separate object)."
+        "LABELING RULES:\n"
+        "- Use concise English noun phrases.\n"
+        "- Prefer the most specific whole-object category that is visually justified.\n"
+        "- Examples: 'Tyrannosaurus rex skeleton', 'flower', 'tree', 'car', 'person', 'chair'.\n"
+        "- Avoid part-level names unless the part itself is a detached object.\n\n"
 
-        "SELF-CHECK (must satisfy before final output):"
-        "For each instance:"
-        "1) box_2d values are within [0,1000] and ymin<ymax, xmin<xmax."
-        "2) All pos_points are inside box_2d."
-        "3) neg_points are not on the target object; prefer near boundaries."
-        "4) The box is tight-visible: not missing object parts and not overly large."
-        "If any check fails, revise internally and output only the corrected JSON."
+        "BOX REQUIREMENTS:\n"
+        "- box_2d must be a tight box around the whole visible object instance.\n"
+        "- Include all visible parts belonging to the same object, including thin or extended parts.\n"
+        "- For complex shapes, the box should enclose the entire visible instance, not only the most salient part.\n"
+        "- Do not make the box excessively large.\n\n"
 
-        "Constraints:\n"
-        f"- Max objects: {max_objects}.\n"
-        f"- Max {points_per_type} positive and {points_per_type} negative points per object.\n"
-        "- Do NOT treat multiple separate instances as a single object.\n\n"
+        "POINT REQUIREMENTS:\n"
+        "pos_points:\n"
+        "- Place points on the target object itself.\n"
+        "- Spread points across different visible regions of the same object.\n"
+        "- For elongated or articulated objects, place points on separated visible parts to represent the whole instance.\n"
+        "- All pos_points must lie inside box_2d.\n"
+        f"- Up to {points_per_type} pos_points.\n\n"
+
+        "neg_points:\n"
+        "- Place points on nearby non-target regions close to the object boundary.\n"
+        "- Use negatives to separate the target object from adjacent objects or background.\n"
+        "- For thin or complex objects, place negatives around the outer contour to prevent leakage.\n"
+        f"- Up to {points_per_type} neg_points.\n\n"
+
+        "SELECTION PRIORITY:\n"
+        "- Prioritize salient, complete, standalone objects.\n"
+        "- If many objects are present, return the most visually important and clearly separable instances first.\n"
+        f"- Maximum number of objects: {max_objects}.\n\n"
+
+        "OUTPUT FORMAT (STRICT JSON ONLY):\n"
+        "- Output must be strict JSON only. No markdown. No extra text.\n"
+        "- Coordinates are normalized to [0,1000].\n"
+        "- box_2d format: [ymin, xmin, ymax, xmax].\n"
+        "- point format: [y, x].\n"
+        "- Values must be within [0,1000] and boxes must satisfy ymin < ymax, xmin < xmax.\n\n"
+
         "JSON schema:\n"
         "{\n"
         "  \"bboxes\": [\n"
         "    {\n"
-        "      \"label\": \"object\",\n"
+        "      \"label\": \"object name\",\n"
         "      \"box_2d\": [ymin, xmin, ymax, xmax],\n"
         "      \"pos_points\": [[y,x], ...],\n"
         "      \"neg_points\": [[y,x], ...]\n"
         "    }\n"
         "  ]\n"
         "}\n"
+
     )
 
-        # "You are an expert visual grounding and segmentation assistant.\n"
-        # "Task: Detect all distinct FOREGROUND objects (e.g., toys, tools, electronics) and generate prompts for segmentation.\n\n"
-        # "Output MUST be strict JSON only. No extra text.\n\n"
-        # "Coordinate System: normalized to [0-1000].\n"
-        # "For EACH object, you MUST output:\n"
-        # "1. box_2d [ymin, xmin, ymax, xmax]: Provide a tight 2D bounding box that encapsulates the entire visible part of the object.\n"
-        # "2. pos_points [y,x]:\n"
-        # "   - Must be placed on the target object, and spread across different parts.\n"
-        # "   - CRITICAL: Place points on high-reflectance, shadowed, or low-texture regions within the object to prevent internal holes/noise.\n"
-        # "   - Ensure points cover diverse parts (e.g., for a toy bus, place points on both the roof and the wheels).\n"
-        # "   - Every pos_point must lie INSIDE the box_2d.\n"
-        # "3. neg_points [y,x]:\n"
-        # "Must be placed outside the target object; do not treat a portion of the target object as another object."
-        # "   - CRITICAL: Focus on 'Occlusion Boundaries'. If object A is partially blocked by object B, place negative points on object B's surface near the contact line.\n"
-        # "   - If two objects are adjacent/touching, place negative points on the neighboring object to prevent SAM from 'leaking' or merging them.\n"
-        # "   - Can place some dots appropriately near the background of the objects.\n\n"
+        # "ROLE:\n"
+        # "You are a precise visual grounding assistant specialized for INSTANCE-LEVEL scene annotation for segmentation.\n\n"
 
-        # "你是视觉检测与定位助手。"
-        # "任务：请从图像中识别出所有的前景物体，并为每个独立物体生成一个尽可能紧致的包围框（tight bbox），不要将不同对象合并为一个框，同时给出主要背景区域的大框（background_bboxes），不同的背景区域用不同的框代表。"
-        # "输出要求："
-        # "仅输出严格JSON，不要输出任何解释文字。\n\n"
-        # "坐标体系：使用像素坐标，原点在左上角 (0,0)。图像尺寸："
-        # f"width={w}, height={h}。\n\n"
-        # f"- 最多输出 {max_objects} 个对象以及{max_background}个背景区域。\n"
-        # "- 所有的bbox 必须是整数像素坐标，且满足 0<=x1<x2<=w, 0<=y1<y2<=h。\n"
-        # "- 尽量覆盖：每个独立物体（玩偶、球、车、胶带卷、钟、笔等），不要把多个物体合成一个框。\n"
-        # "- background_bboxes：选择主要“桌面/地面/墙面”等背景区域。"
-        # "- label：为每个bbox生成简短的描述性标签，如“red ball”、“wooden table top”等。\n\n"
-        # "输出格式：\n"
+        # "PRIMARY OBJECTIVE:\n"
+        # "Return prompts (box_2d + pos_points + neg_points) for ALL object-level instances and major stuff regions so that labeled regions collectively COVER THE ENTIRE IMAGE.\n\n"
+
+        # "WHAT MUST BE LABELED:\n"
+        # "A) THINGS: all countable object instances (each physical item is one entry).\n"
+        # "   - Include objects inside other objects/containers (e.g., items inside a transparent box).\n"
+        # "B) STUFF: all major background/structural regions that fill the scene.\n"
+        # "   - MUST include when visible: tabletop surface, wall(s), window/glass pane(s), window frames/mullions.\n"
+        # "   - If visible through glass, include outdoor view as 1–3 large regions (do not over-fragment).\n\n"
+
+        # "INSTANCE CONSISTENCY (CRITICAL):\n"
+        # "- ONE ENTRY = ONE WHOLE OBJECT/REGION.\n"
+        # "- Do NOT split one object into parts: for a camera, output ONE entry for the entire camera (body+lens+buttons as one object).\n"
+        # "- Do NOT output separate entries for different parts of the same object unless clearly detached separate items.\n"
+        # "- OCCLUSION/FRAGMENT MERGE: if an object is partially occluded and appears separated into multiple visible fragments, output ONE entry covering ALL visible fragments (one box spanning the fragments).\n"
+        # "- Do NOT duplicate the same object.\n"
+        # "- Do NOT group multiple distinct objects into one entry.\n\n"
+
+        # "FULL-SCENE COVERAGE AUDIT (DO THIS BEFORE OUTPUT):\n"
+        # "- After listing things and stuff, verify coverage of:\n"
+        # "  * Top-left, top-right, bottom-left, bottom-right corners\n"
+        # "  * Along the top edge (usually window/sky), and large central background areas\n"
+        # "  * Any large planar area (wall/glass/table) that remains unlabeled\n"
+        # "- If any large region is unlabeled, add a stuff entry for it (wall/glass/outdoor/table/other plane).\n\n"
+
+        # "OUTPUT FORMAT (STRICT JSON ONLY):\n"
+        # "- Output MUST be strict JSON only. No markdown. No extra text.\n"
+        # "- Coordinates are normalized to [0,1000].\n"
+        # "- box_2d format: [ymin, xmin, ymax, xmax].\n"
+        # "- point format: [y, x].\n"
+        # "- Values must be within [0,1000] and boxes must satisfy ymin<ymax, xmin<xmax.\n\n"
+
+        # "BOX REQUIREMENTS:\n"
+        # "- Tight box around ONLY the target instance/region.\n"
+        # "- For whole objects: include all visible parts (thin straps/cables/legs/handles).\n"
+        # "- For occluded objects: include all visible fragments in ONE box.\n\n"
+
+        # "POINT REQUIREMENTS:\n"
+        # "pos_points:\n"
+        # "- On the target, spread across distinct parts/areas.\n"
+        # "- For large planar stuff (glass/wall/table): spread points broadly (center + near corners).\n"
+        # "- All pos_points MUST lie inside box_2d.\n"
+        # f"- Up to {points_per_type} pos_points.\n"
+        # "neg_points:\n"
+        # "- On nearby NON-target pixels near boundaries to prevent SAM leakage.\n"
+        # "- Prefer on adjacent objects/surfaces at contact boundaries (object vs table, glass vs frame, wall vs window frame).\n"
+        # f"- Up to {points_per_type} neg_points.\n\n"
+
+        # "CONSTRAINTS:\n"
+        # f"- Max objects(regions) allowed: {max_objects}. Use them wisely to maximize coverage.\n"
+        # "- Prefer covering the entire scene over adding redundant tiny regions.\n\n"
+
+        # "JSON schema:\n"
         # "{\n"
         # "  \"bboxes\": [\n"
-        # "    {\"label\": \"object_1\", \"box_2d\": [x1,y1,x2,y2]},\n"
-        # "    {\"label\": \"object_2\", \"box_2d\": [x1,y1,x2,y2]}\n"
-        # "  ],\n"
-        # "  \"background_bboxes\": [\n"
-        # "    {\"label\": \"background_1\", \"box_2d\": [x1,y1,x2,y2]},\n"
-        # "    {\"label\": \"background_2\", \"box_2d\": [x1,y1,x2,y2]}\n"
+        # "    {\n"
+        # "      \"label\": \"object\",\n"
+        # "      \"box_2d\": [ymin, xmin, ymax, xmax],\n"
+        # "      \"pos_points\": [[y,x], ...],\n"
+        # "      \"neg_points\": [[y,x], ...]\n"
+        # "    }\n"
         # "  ]\n"
-        # "}\n\n"
+        # "}\n"
 
     resp = client.chat.completions.create(
         model=MODEL,
@@ -261,7 +307,15 @@ def vlm_get_all_bboxes(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Return JSON with all foreground objects, each with box_2d + pos_points + neg_points."},
+                    {"type": "text", 
+                    # "text": "Return JSON for ALL distinct things AND major stuff regions in the entire scene (including glass/window, window frames, walls, floor/ground, tabletop, outdoor view regions), with box_2d + pos_points + neg_points. Do not miss large planar regions."
+                    "text": 
+                            "Return JSON for all salient standalone object instances in the image. "
+                            "Detect whole objects only. Do not split one object into parts. "
+                            "Do not include background or stuff regions. "
+                            "For each object, return label, box_2d, pos_points, and neg_points."
+                    },
+                    
                     {"type": "image_url", "image_url": {"url": data_url}},
                 ],
             },
@@ -269,13 +323,16 @@ def vlm_get_all_bboxes(
         temperature=0,
         timeout=100,
     )
+    # Return JSON with all foreground objects, each with box_2d + pos_points + neg_points
 
+    
     text = resp.choices[0].message.content or ""
     text = _extract_json(text)
     obj = json.loads(text)
 
     # 轻量校验/裁剪
-    raw_fg = (obj.get("bboxes") or [])[:max_objects]
+    # raw_fg = (obj.get("bboxes") or [])[:max_objects]
+    raw_fg = (obj.get("bboxes") or [])
     # raw_bg = (obj.get("background_bboxes") or [])[:max_background]
 
     # 转换为像素 xyxy

@@ -73,12 +73,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--i", dest="image_path", default=os.environ.get("IMG", ""), help="path to image")
     ap.add_argument("--output_root", default=os.environ.get("OUTPUT_ROOT", ""), help="output root dir")
+    ap.add_argument("--rerun", default=False, action="store_true", help="force rerun VLM to get bboxes, even if existing JSON found")
 
     args = ap.parse_args()
 
     # image_path = os.environ.get("IMG", "/home/majortom/majortom/datasets/desktopobjects_360/desk1_4_VLM/images_4/0021.jpg")
 
-    max_objects = int(os.environ.get("MAX_OBJECTS", "15"))
+    max_objects = int(os.environ.get("MAX_OBJECTS", "40"))
     # max_background = int(os.environ.get("MAX_BACKGROUND", "3"))
     image_path = args.image_path
     
@@ -100,7 +101,7 @@ def main():
     json_pattern = os.path.join(output_dir, f"bboxes_{stem}_*.json")
     existing_jsons = glob.glob(json_pattern)
 
-    if not existing_jsons:
+    if not existing_jsons or args.rerun:
         result = vlm_get_all_bboxes(
             image_path,
             max_objects=max_objects, 
